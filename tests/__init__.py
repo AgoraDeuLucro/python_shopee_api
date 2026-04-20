@@ -1,0 +1,1 @@
+# Testes para biblioteca amazon_sp_api
