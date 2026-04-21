@@ -1,188 +1,433 @@
+import hashlib
+import hmac
+from time import sleep, time
 import requests
-from time import sleep
 
 
-class SPAPIError(Exception):
-    """Exceção base para erros da Amazon SP-API."""
-    def __init__(self, message, status_code=None, response_data=None):
+class ShopeeAPIError(Exception):
+    """Exceção base para erros da Shopee Open API."""
+    def __init__(self, message, status_code=None, error_code=None, response_data=None):
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code
         self.response_data = response_data
 
 
-class RateLimitExceededError(SPAPIError):
+class RateLimitExceededError(ShopeeAPIError):
     """Exceção para quando o rate limit é excedido e as tentativas de retry se esgotam."""
     pass
 
 
 class auth():
-    """Classe base com autenticação e controle de requisições para a Amazon SP-API.
-    
-    A SP-API utiliza o algoritmo de token bucket para rate limiting, com limites
-    dinâmicos por operação e par vendedor/aplicação. Por isso, o controle de rate
-    limit é feito de forma reativa: em caso de HTTP 429, a requisição é retentada
-    com backoff exponencial (1s → 2s → 4s), conforme recomendação oficial da Amazon.
-    
-    Referência: https://developer-docs.amazon.com/sp-api/docs/usage-plans-and-rate-limits
+    """Classe base com autenticação e controle de requisições para a Shopee Open API v2.
+
+    A Shopee Open API v2 exige que toda requisição seja assinada com HMAC-SHA256
+    no momento do envio. A assinatura é calculada a partir de uma base string que
+    combina partner_id, caminho da API, timestamp, access_token e shop_id (ou
+    merchant_id). Os parâmetros de autenticação são enviados na query string.
+
+    Rate limiting: a Shopee não publica limites numéricos fixos. O controle é feito
+    de forma reativa: em caso de HTTP 429 ou erro JSON com 'rate_limit', a requisição
+    é retentada com backoff exponencial (1s → 2s → 4s), até _MAX_RETRIES tentativas.
+
+    Referência: https://open.shopee.com/developer-guide/16
     """
 
     _ENDPOINTS = {
-        'na': 'https://sellingpartnerapi-na.amazon.com',  # América do Norte (US, CA, MX, BR)
-        'eu': 'https://sellingpartnerapi-eu.amazon.com',  # Europa (UK, DE, FR, IT, ES, etc.)
-        'fe': 'https://sellingpartnerapi-fe.amazon.com',  # Extremo Oriente (JP, AU, SG)
+        'sg': 'https://partner.shopeemobile.com',          # Padrão — servidor próximo a SG
+        'br': 'https://openplatform.shopee.com.br',         # Servidor próximo aos EUA/BR
+        'cn': 'https://openplatform.shopee.cn',             # Mainland China
+        'sandbox': 'https://openplatform.sandbox.test-stable.shopee.sg',  # Testes
     }
 
     _MAX_RETRIES = 3
 
-    def __init__(self, access_token="", region="na", print_error=True):
+    def __init__(self, partner_id, partner_key, access_token="", shop_id=None,
+                 merchant_id=None, env="sg", print_error=True):
         """
         Args:
-            access_token (str): Token de acesso para a SP-API (LWA access token).
-            region (str): Região do endpoint ('na', 'eu', 'fe').
+            partner_id (int): ID do parceiro (App), obtido no Shopee Open Platform Console.
+            partner_key (str): Chave do parceiro (App), obtida no Console.
+            access_token (str): Token de acesso do vendedor autorizado. Válido por 4h.
+            shop_id (int | None): ID da loja autorizada. Obrigatório para Shop APIs.
+            merchant_id (int | None): ID do merchant. Usado apenas por sellers cross-border.
+            env (str): Ambiente do endpoint ('sg', 'br', 'cn', 'sandbox').
             print_error (bool): Se True, imprime detalhes de erros no console.
         """
-        if region not in self._ENDPOINTS:
-            raise ValueError(f"Região inválida. Escolha entre: {', '.join(self._ENDPOINTS.keys())}")
+        if env not in self._ENDPOINTS:
+            raise ValueError(f"Ambiente inválido. Escolha entre: {', '.join(self._ENDPOINTS.keys())}")
 
+        self.partner_id = partner_id
+        self.partner_key = partner_key
         self.access_token = access_token
-        self.region = region
-        self.endpoint = self._ENDPOINTS[region]
+        self.shop_id = shop_id
+        self.merchant_id = merchant_id
+        self.env = env
+        self.endpoint = self._ENDPOINTS[env]
         self.print_error = print_error
 
-    def request(self, method="GET", url="", headers=None, params=None, data=None):
-        """Método unificado para requisições à SP-API com retry em 429.
+    def _generate_sign(self, api_path, timestamp, access_token="", shop_id=None, merchant_id=None):
+        """Calcula a assinatura HMAC-SHA256 para uma requisição.
 
-        Em caso de HTTP 429 (rate limit), aguarda com backoff exponencial e retenta
-        automaticamente até _MAX_RETRIES vezes antes de lançar RateLimitExceededError.
+        A base string varia conforme o tipo de API:
+        - Shop API:     partner_id + api_path + timestamp + access_token + shop_id
+        - Merchant API: partner_id + api_path + timestamp + access_token + merchant_id
+        - Public API:   partner_id + api_path + timestamp
 
         Args:
-            method (str): Método HTTP ('GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS').
-            url (str): URL completa da requisição.
-            headers (dict): Headers adicionais (mesclados com os padrão).
-            params (dict): Parâmetros de query string.
-            data: Corpo da requisição (passar json.dumps(dict) para enviar JSON).
+            api_path (str): Caminho da API sem o host. Ex: '/api/v2/order/get_order_list'.
+            timestamp (int): Unix epoch em segundos.
+            access_token (str): Token de acesso (vazio para Public APIs).
+            shop_id (int | None): ID da loja (Shop APIs).
+            merchant_id (int | None): ID do merchant (Merchant APIs).
 
         Returns:
-            requests.Response: Objeto de resposta em caso de sucesso (200 ou 201).
-            None: Em caso de 403 ou 404.
+            str: Assinatura hexadecimal em letras minúsculas.
         """
-        req_params = params if params is not None else {}
-        req_headers = headers if headers is not None else {}
-        req_data = data if data is not None else {}
+        if shop_id is not None:
+            base_string = f"{self.partner_id}{api_path}{timestamp}{access_token}{shop_id}"
+        elif merchant_id is not None:
+            base_string = f"{self.partner_id}{api_path}{timestamp}{access_token}{merchant_id}"
+        else:
+            base_string = f"{self.partner_id}{api_path}{timestamp}"
 
+        return hmac.new(
+            self.partner_key.encode(),
+            base_string.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+    def request(self, method="GET", path="", params=None, body=None):
+        """Método unificado para requisições à Shopee Open API v2.
+
+        Assina automaticamente cada requisição com HMAC-SHA256 e adiciona os
+        parâmetros comuns (partner_id, timestamp, sign, access_token, shop_id)
+        à query string. Em caso de rate limit (HTTP 429 ou erro JSON com
+        'rate_limit'), retenta com backoff exponencial até _MAX_RETRIES vezes.
+
+        Args:
+            method (str): Método HTTP ('GET' ou 'POST').
+            path (str): Caminho da API sem o host. Ex: '/api/v2/order/get_order_list'.
+            params (dict | None): Parâmetros de query string adicionais (além dos comuns).
+            body (dict | None): Corpo da requisição para métodos POST.
+
+        Returns:
+            requests.Response: Objeto de resposta em caso de sucesso.
+            None: Em caso de erro HTTP 403 ou 404.
+        """
+        url = self.endpoint + path
+        req_params = params.copy() if params is not None else {}
+
+        timestamp = int(time())
+        sign = self._generate_sign(
+            api_path=path,
+            timestamp=timestamp,
+            access_token=self.access_token,
+            shop_id=self.shop_id,
+            merchant_id=self.merchant_id,
+        )
+
+        common_params = {
+            "partner_id": self.partner_id,
+            "timestamp": timestamp,
+            "sign": sign,
+        }
         if self.access_token:
-            req_headers["x-amz-access-token"] = self.access_token
+            common_params["access_token"] = self.access_token
+        if self.shop_id is not None:
+            common_params["shop_id"] = self.shop_id
+        elif self.merchant_id is not None:
+            common_params["merchant_id"] = self.merchant_id
 
-        req_headers.setdefault("Content-Type", "application/json")
-        req_headers.setdefault("Accept", "application/json")
+        req_params.update(common_params)
+
+        headers = {"Content-Type": "application/json"}
 
         retries = 0
         delay = 1
 
         while True:
-            match method:
-                case "GET":
-                    response = requests.get(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "PUT":
-                    response = requests.put(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "POST":
-                    response = requests.post(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "DELETE":
-                    response = requests.delete(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "HEAD":
-                    response = requests.head(url=url, params=req_params, headers=req_headers, data=req_data)
-                case "OPTIONS":
-                    response = requests.options(url=url, params=req_params, headers=req_headers, data=req_data)
+            if method == "GET":
+                response = requests.get(url=url, params=req_params, headers=headers)
+            else:
+                response = requests.post(url=url, params=req_params, json=body, headers=headers)
 
-            if response.status_code in (200, 201):
-                return response
+            # A Shopee retorna HTTP 200 mesmo em erros de lógica; é necessário
+            # checar o campo JSON 'error'. Respostas de arquivo (download) não
+            # têm JSON, por isso o bloco try/except.
+            is_rate_limit = response.status_code == 429
+            error_code = ""
+            if not is_rate_limit:
+                try:
+                    resp_json = response.json()
+                    error_code = resp_json.get("error", "")
+                    if "rate_limit" in error_code:
+                        is_rate_limit = True
+                except Exception:
+                    pass
 
-            elif response.status_code == 429:
+            if is_rate_limit:
                 retries += 1
                 if retries > self._MAX_RETRIES:
                     raise RateLimitExceededError(
                         f"Rate limit excedido após {self._MAX_RETRIES} tentativas. Tente novamente mais tarde.",
-                        status_code=429
+                        status_code=response.status_code,
+                        error_code=error_code,
                     )
                 if self.print_error:
-                    rate_limit = response.headers.get("x-amzn-RateLimit-Limit", "desconhecido")
                     print(
-                        f"Rate limit atingido (x-amzn-RateLimit-Limit: {rate_limit}). "
+                        f"Rate limit atingido. "
                         f"Aguardando {delay}s antes de retentar "
                         f"(tentativa {retries}/{self._MAX_RETRIES})..."
                     )
                 sleep(delay)
                 delay *= 2
+                continue
 
-            else:
+            if response.status_code in (403, 404):
+                if self.print_error:
+                    print(f"Erro HTTP {response.status_code} — URL: {url}")
+                return None
+
+            if response.status_code not in (200, 201):
                 if self.print_error:
                     try:
-                        response_json = response.json()
-                        errors = response_json.get('errors', [])
-                        message = errors[0].get('message', '') if errors else response_json.get('message', '')
-                        json_content = response_json
+                        json_content = response.json()
+                        message = json_content.get("message", "")
                     except Exception:
                         message = ""
                         json_content = response.text
-
-                    print(f"""Erro no retorno da SP-API
+                    print(f"""Erro no retorno da Shopee Open API
 Mensagem: {message}
 URL: {url}
 Método: {method}
 Parâmetros: {req_params}
-Headers: {req_headers}
-Data: {req_data}
-Resposta JSON: {json_content}""")
+Corpo: {body}
+Resposta: {json_content}""")
+                break
 
-                if response.status_code in (403, 404):
-                    return None
-                else:
-                    break
+            # Verifica erros de lógica embutidos no JSON (HTTP 200 com error != "")
+            if error_code and self.print_error:
+                try:
+                    resp_json = response.json()
+                    message = resp_json.get("message", "")
+                except Exception:
+                    message = ""
+                print(f"""Erro retornado pela Shopee Open API
+Código: {error_code}
+Mensagem: {message}
+URL: {url}
+Método: {method}
+Parâmetros: {req_params}""")
+
+            return response
+
+    def get_access_token(self, code, shop_id=None, main_account_id=None):
+        """Obtém o access_token pela primeira vez após autorização do vendedor.
+
+        Após o vendedor autorizar o App, use o 'code' retornado na URL de callback
+        para obter o par inicial de access_token e refresh_token.
+
+        Args:
+            code (str): Código de autorização recebido na URL de callback.
+            shop_id (int | None): ID da loja autorizada (para autorização via conta da loja).
+            main_account_id (int | None): ID da conta principal (para autorização via conta principal).
+
+        Returns:
+            dict: Resposta da API contendo access_token, refresh_token, expire_in, etc.
+                  Retorna dict vazio em caso de falha.
+        """
+        path = "/api/v2/auth/token/get"
+        timestamp = int(time())
+        sign = self._generate_sign(api_path=path, timestamp=timestamp)
+
+        query_params = {
+            "partner_id": self.partner_id,
+            "timestamp": timestamp,
+            "sign": sign,
+        }
+
+        body = {"code": code, "partner_id": self.partner_id}
+        if shop_id is not None:
+            body["shop_id"] = shop_id
+        elif main_account_id is not None:
+            body["main_account_id"] = main_account_id
+
+        response = requests.post(
+            url=self.endpoint + path,
+            params=query_params,
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        if self.print_error:
+            print(f"Erro ao obter access_token: HTTP {response.status_code} — {response.text}")
+        return {}
+
+    def refresh_access_token(self, refresh_token, shop_id=None, merchant_id=None):
+        """Renova o access_token usando o refresh_token.
+
+        Deve ser chamado antes do access_token expirar (validade de 4h). Após a
+        chamada, o novo refresh_token retornado deve ser salvo — o anterior se
+        torna inválido.
+
+        Args:
+            refresh_token (str): Token de renovação. Válido por 30 dias.
+            shop_id (int | None): ID da loja (shops locais).
+            merchant_id (int | None): ID do merchant (sellers cross-border).
+
+        Returns:
+            dict: Resposta da API contendo o novo access_token, refresh_token e expire_in.
+                  Retorna dict vazio em caso de falha.
+        """
+        path = "/api/v2/auth/access_token/get"
+        timestamp = int(time())
+        sign = self._generate_sign(api_path=path, timestamp=timestamp)
+
+        query_params = {
+            "partner_id": self.partner_id,
+            "timestamp": timestamp,
+            "sign": sign,
+        }
+
+        body = {"refresh_token": refresh_token, "partner_id": self.partner_id}
+        if shop_id is not None:
+            body["shop_id"] = shop_id
+        elif merchant_id is not None:
+            body["merchant_id"] = merchant_id
+
+        response = requests.post(
+            url=self.endpoint + path,
+            params=query_params,
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        if self.print_error:
+            print(f"Erro ao renovar access_token: HTTP {response.status_code} — {response.text}")
+        return {}
 
 
-class invoices(auth):
-    """Operações da API de Notas Fiscais (Invoices) da Amazon SP-API.
+class order(auth):
+    """Operações do módulo Order da Shopee Open API v2, com foco em notas fiscais (BR).
 
-    Documentação: https://developer-docs.amazon.com/sp-api/docs/invoices-api
+    Documentação: https://open.shopee.com/documents/v2/v2.order.get_pending_buyer_invoice_order_list
     """
 
-    def get_invoices(self, marketplace_id, **kwargs):
-        """Busca notas fiscais com base nos parâmetros informados.
+    def get_pending_invoice_orders(self, page_size=50, cursor=""):
+        """Lista pedidos pendentes de upload de nota fiscal.
+
+        Esta rota está disponível apenas para sellers locais do Brasil e Filipinas.
 
         Args:
-            marketplace_id (str): ID do Marketplace da Amazon.
-                                  Ex: 'A2Q3Y263D00KWC' para o Brasil.
-            **kwargs: Parâmetros de filtro adicionais:
-                - dateStart (str): Data de início no formato ISO 8601 (YYYY-MM-DD).
-                - dateEnd (str): Data de fim no formato ISO 8601 (YYYY-MM-DD).
+            page_size (int): Quantidade de resultados por página (1–100). Padrão: 50.
+            cursor (str): Cursor de paginação. Deixe vazio "" para a primeira página.
 
         Returns:
-            dict: Dados das notas fiscais ou dict vazio se falhou.
+            dict: Resposta contendo 'order_list', 'more' e 'next_cursor',
+                  ou dict vazio em caso de falha.
         """
-        url = self.endpoint + "/tax/invoices/2024-06-19/invoices"
+        path = "/api/v2/order/get_pending_buyer_invoice_order_list"
+        params = {"page_size": page_size, "cursor": cursor}
 
-        params = {"marketplaceId": marketplace_id}
-        params.update(kwargs)
-
-        response = self.request("GET", url=url, params=params)
+        response = self.request("GET", path=path, params=params)
 
         if response:
             return response.json()
         return {}
 
-    def get_invoice_document(self, document_id):
-        """Recupera os detalhes de um documento de nota fiscal específico.
+    def upload_invoice(self, order_sn, invoice_doc, doc_type="XML"):
+        """Faz upload de uma nota fiscal para um pedido.
 
         Args:
-            document_id (str): ID do documento da nota fiscal.
+            order_sn (str): Identificador único do pedido na Shopee.
+            invoice_doc (bytes | str): Conteúdo do arquivo da NF-e (XML ou PDF).
+            doc_type (str): Tipo do documento ('XML' ou 'PDF'). Padrão: 'XML'.
 
         Returns:
-            dict: Dados do documento ou dict vazio se falhou.
+            dict: Resposta da API ou dict vazio em caso de falha.
         """
-        url = self.endpoint + f"/tax/invoices/2024-06-19/documents/{document_id}"
+        path = "/api/v2/order/upload_invoice_doc"
 
-        response = self.request("GET", url=url)
+        timestamp = int(time())
+        sign = self._generate_sign(
+            api_path=path,
+            timestamp=timestamp,
+            access_token=self.access_token,
+            shop_id=self.shop_id,
+            merchant_id=self.merchant_id,
+        )
+
+        query_params = {
+            "partner_id": self.partner_id,
+            "timestamp": timestamp,
+            "sign": sign,
+            "access_token": self.access_token,
+        }
+        if self.shop_id is not None:
+            query_params["shop_id"] = self.shop_id
+
+        files = {
+            "order_sn": (None, order_sn),
+            "doc_type": (None, doc_type),
+            "invoice_doc": ("invoice", invoice_doc if isinstance(invoice_doc, bytes) else invoice_doc.encode()),
+        }
+
+        response = requests.post(
+            url=self.endpoint + path,
+            params=query_params,
+            files=files,
+        )
+
+        if response and response.status_code == 200:
+            data = response.json()
+            error_code = data.get("error", "")
+            if error_code and self.print_error:
+                print(f"Erro ao fazer upload da NF — Código: {error_code} | Mensagem: {data.get('message', '')}")
+            return data
+
+        if self.print_error:
+            print(f"Erro HTTP {response.status_code} ao fazer upload da NF para o pedido {order_sn}")
+        return {}
+
+    def download_invoice(self, order_sn):
+        """Faz download do arquivo de nota fiscal de um pedido.
+
+        Esta rota está disponível apenas para sellers locais do Brasil e Filipinas.
+        Retorna o conteúdo binário do arquivo (XML ou PDF).
+
+        Args:
+            order_sn (str): Identificador único do pedido na Shopee.
+
+        Returns:
+            bytes: Conteúdo binário do arquivo da NF-e, ou b'' em caso de falha.
+        """
+        path = "/api/v2/order/download_invoice_doc"
+        params = {"order_sn": order_sn}
+
+        response = self.request("GET", path=path, params=params)
 
         if response:
-            return response.json()
-        return {}
+            return response.content
+        return b""
+
+    def download_invoices_batch(self, order_sns):
+        """Faz download das notas fiscais de múltiplos pedidos.
+
+        A Shopee não oferece endpoint de download em lote; este método itera
+        sobre a lista chamando download_invoice() individualmente.
+
+        Args:
+            order_sns (list[str]): Lista de order_sn dos pedidos.
+
+        Returns:
+            dict[str, bytes]: Dicionário {order_sn: conteúdo_binário}.
+                              Pedidos com falha retornam b''.
+        """
+        return {order_sn: self.download_invoice(order_sn) for order_sn in order_sns}
