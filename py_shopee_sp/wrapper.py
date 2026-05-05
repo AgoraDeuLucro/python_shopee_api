@@ -431,3 +431,68 @@ class order(auth):
                               Pedidos com falha retornam b''.
         """
         return {order_sn: self.download_invoice(order_sn) for order_sn in order_sns}
+
+    def get_order_list(self, time_from, time_to, time_range_field="create_time",
+                       page_size=50, order_status=None, cursor=""):
+        """Lista pedidos por período.
+
+        Limites: create_time → máx. 15 dias; update_time → 7 dias. page_size: 1–100.
+        Paginação: use 'next_cursor' retornado enquanto 'more' == True.
+
+        Args:
+            time_from (int): Unix timestamp de início.
+            time_to (int): Unix timestamp de fim.
+            time_range_field (str): 'create_time' (padrão) ou 'update_time'.
+            page_size (int): 1–100. Padrão: 50.
+            order_status (str | None): Ex: 'SHIPPED', 'COMPLETED'. None = todos.
+            cursor (str): Cursor da página anterior. Vazio para a primeira.
+
+        Returns:
+            dict: 'order_list', 'more', 'next_cursor' ou {} em caso de falha.
+        """
+        path = "/api/v2/order/get_order_list"
+        params = {
+            "time_range_field": time_range_field,
+            "time_from": time_from,
+            "time_to": time_to,
+            "page_size": page_size,
+            "response_optional_fields": "order_status",
+        }
+        if order_status:
+            params["order_status"] = order_status
+        if cursor:
+            params["cursor"] = cursor
+
+        response = self.request("GET", path=path, params=params)
+
+        if response:
+            data = response.json()
+            return data.get("response", {})
+        return {}
+
+    def get_order_detail(self, order_sn_list, response_optional_fields="invoice_data"):
+        """Retorna detalhes de pedidos.
+
+        Limite: máximo 50 order_sn por chamada.
+        'invoice_data' contém o access_key para download de NF-e (BR).
+
+        Args:
+            order_sn_list (list[str]): Lista de order_sn (máx. 50).
+            response_optional_fields (str): Campos extras separados por vírgula.
+                                            Padrão: 'invoice_data'.
+
+        Returns:
+            dict: 'order_list' com detalhes ou {} em caso de falha.
+        """
+        path = "/api/v2/order/get_order_detail"
+        params = {
+            "order_sn_list": ",".join(order_sn_list),
+            "response_optional_fields": response_optional_fields,
+        }
+
+        response = self.request("GET", path=path, params=params)
+
+        if response:
+            data = response.json()
+            return data.get("response", {})
+        return {}
